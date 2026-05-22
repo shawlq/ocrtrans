@@ -1,1 +1,4 @@
-# 仅使用 Python 标准库（tkinter），无需额外依赖
+# file_player.py 仅使用标准库（tkinter）
+# file2qrc_player.py 需要二维码生成
+qrcode[pil]>=7.4
+Pillow>=10.0
