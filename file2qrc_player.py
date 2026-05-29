@@ -25,9 +25,130 @@ except ImportError as e:
 
 CHUNK_SIZE = 2000
 DEFAULT_TICK_SECONDS = 1.0
-QRC_PREFIX = ".qrc%%"
 QR_BOX_SIZE = 8
 QR_BORDER = 2
+
+# 目录遍历时跳过的二进制/非文本类扩展名
+BINARY_EXTENSIONS = {
+    ".bin",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".obj",
+    ".o",
+    ".a",
+    ".lib",
+    ".pyc",
+    ".pyo",
+    ".pyd",
+    ".whl",
+    ".egg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".webp",
+    ".tiff",
+    ".tif",
+    ".mp3",
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+    ".class",
+    ".jar",
+    ".war",
+    ".pkl",
+    ".pickle",
+    ".npy",
+    ".npz",
+    ".pt",
+    ".pth",
+    ".onnx",
+    ".h5",
+    ".keras",
+    ".wasm",
+    ".cur",
+    ".msi",
+    ".dmg",
+    ".iso",
+    ".img",
+}
+
+# 目录遍历时跳过的子目录（版本库、依赖、缓存等）
+SKIP_DIR_NAMES = {
+    ".git",
+    ".svn",
+    ".hg",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+}
+
+
+def is_binary_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in BINARY_EXTENSIONS:
+        return True
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(8192)
+        if not chunk:
+            return False
+        if b"\x00" in chunk:
+            return True
+        non_text = sum(
+            1 for b in chunk if b < 9 or (13 < b < 32 and b not in (9, 10, 13))
+        )
+        if non_text / len(chunk) > 0.30:
+            return True
+    except OSError:
+        return True
+    return False
+
+
+def collect_files(root: str) -> list[str]:
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"不是有效目录: {root}")
+
+    files: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            if not is_binary_file(path):
+                files.append(path)
+    return sorted(files)
 
 
 def format_duration(seconds: float) -> str:
@@ -58,8 +179,12 @@ def chunk_count_for_size(size: int) -> int:
     return (size + CHUNK_SIZE - 1) // CHUNK_SIZE
 
 
-def build_qr_payload(index: int, chunk: bytes) -> bytes:
-    return f"{index}{QRC_PREFIX}".encode("ascii") + chunk
+LAST_CHUNK_INDEX = 99999999
+
+
+def build_qr_payload(rel_path: str, index: int, chunk: bytes) -> bytes:
+    path = rel_path.replace("\\", "/")
+    return f"{path}%%{index}%%".encode("ascii") + chunk
 
 
 def md5_hex(data: bytes) -> str:
@@ -79,11 +204,15 @@ def make_qr_image(payload: bytes) -> Image.Image:
 
 
 class File2QrcPlayerApp:
-    def __init__(self, file_path: str) -> None:
-        self.file_path = os.path.abspath(file_path)
-        self.file_size = os.path.getsize(self.file_path)
-        self.chunks = load_file_chunks(self.file_path)
-        self.total_count = len(self.chunks)
+    def __init__(self, files: list[str], root_dir: str | None = None) -> None:
+        self.files = [os.path.abspath(p) for p in files]
+        self.root_dir = os.path.abspath(root_dir) if root_dir else None
+        self.file_index = 0
+        self.file_path = ""
+        self.file_size = 0
+        self.chunks: list[bytes] = []
+        self.total_count = 0
+        self._load_current_file()
 
         self._stop = threading.Event()
         self._playing = threading.Event()
@@ -145,10 +274,37 @@ class File2QrcPlayerApp:
         self._worker = threading.Thread(target=self._play_loop, daemon=True)
         self._worker.start()
 
+    def _load_current_file(self) -> None:
+        self.file_path = self.files[self.file_index]
+        self.file_size = os.path.getsize(self.file_path)
+        self.chunks = load_file_chunks(self.file_path)
+        self.total_count = len(self.chunks)
+        self._current_index = 0
+        self._played_count = 0
+
+    def _display_name(self, path: str) -> str:
+        if self.root_dir:
+            try:
+                return os.path.relpath(path, self.root_dir)
+            except ValueError:
+                pass
+        return os.path.basename(path)
+
+    def _total_chunks_all(self) -> int:
+        total = 0
+        for path in self.files:
+            total += chunk_count_for_size(os.path.getsize(path))
+        return total
+
     def _refresh_header(self) -> None:
-        name = os.path.basename(self.file_path)
+        name = self._display_name(self.file_path)
+        if len(self.files) > 1:
+            prefix = f"[{self.file_index + 1}/{len(self.files)}] "
+        else:
+            prefix = ""
         self.header_var.set(
-            f"文件: {name}  |  大小: {self.file_size:,} 字节  |  二维码总数: {self.total_count}"
+            f"文件: {prefix}{name}  |  大小: {self.file_size:,} 字节  |  "
+            f"本文件二维码: {self.total_count}"
         )
 
     def _get_tick_seconds(self) -> float:
@@ -202,10 +358,15 @@ class File2QrcPlayerApp:
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
         self._log_path = os.path.join(os.getcwd(), f"output_qrc_{stamp}.txt")
         self._log_file = open(self._log_path, "w", encoding="utf-8")
-        self._log_file.write(
-            f"# 源文件: {self.file_path}\n"
-            f"# 格式: 序号:块MD5:二维码内容MD5\n"
-        )
+        if self.root_dir:
+            self._log_file.write(f"# 源目录: {self.root_dir}\n# 文件数: {len(self.files)}\n")
+        self._log_file.write("# 格式: 序号:块MD5:二维码内容MD5\n")
+        self._write_log_file_header()
+
+    def _write_log_file_header(self) -> None:
+        if self._log_file is None:
+            return
+        self._log_file.write(f"# 源文件: {self.file_path}\n")
 
     def _append_log(self, index: int, chunk: bytes, payload: bytes) -> None:
         if self._log_file is None:
@@ -226,7 +387,8 @@ class File2QrcPlayerApp:
         img.save(path, format="PNG")
 
     def _show_qr(self, index: int, chunk: bytes) -> None:
-        payload = build_qr_payload(index, chunk)
+        rel_path = self._display_name(self.file_path)
+        payload = build_qr_payload(rel_path, index, chunk)
         img = make_qr_image(payload)
         self._save_qr_image(index, img)
 
@@ -246,17 +408,27 @@ class File2QrcPlayerApp:
         self._stats_running = True
         self.stats_btn.config(state=tk.DISABLED)
         tick = self._get_tick_seconds()
-        count = self.total_count
+        count = self._total_chunks_all() if len(self.files) > 1 else self.total_count
         seconds = count * tick
         tick_s = f"{tick:g}" if tick == int(tick) else f"{tick:.2f}"
-        msg = (
-            f"文件: {self.file_path}\n\n"
-            f"文件大小: {self.file_size:,} 字节\n"
-            f"每块大小: {CHUNK_SIZE} 字节\n"
-            f"二维码张数: {count}\n"
-            f"每张停留: {tick_s} 秒\n\n"
-            f"预计播放时长: {format_duration(seconds)}"
-        )
+        if len(self.files) > 1:
+            msg = (
+                f"目录: {self.root_dir}\n\n"
+                f"文件数: {len(self.files)}\n"
+                f"每块大小: {CHUNK_SIZE} 字节\n"
+                f"二维码总张数: {count}\n"
+                f"每张停留: {tick_s} 秒\n\n"
+                f"预计播放时长: {format_duration(seconds)}"
+            )
+        else:
+            msg = (
+                f"文件: {self.file_path}\n\n"
+                f"文件大小: {self.file_size:,} 字节\n"
+                f"每块大小: {CHUNK_SIZE} 字节\n"
+                f"二维码张数: {count}\n"
+                f"每张停留: {tick_s} 秒\n\n"
+                f"预计播放时长: {format_duration(seconds)}"
+            )
         self.win.after(0, lambda: self._stats_done(msg))
 
     def _stats_done(self, msg: str) -> None:
@@ -284,14 +456,16 @@ class File2QrcPlayerApp:
             time.sleep(0.05)
         return True
 
-    def _play_loop(self) -> None:
+    def _play_current_file(self) -> bool:
         while self._current_index < self.total_count and not self._stop.is_set():
             if not self._wait_until_playing():
                 continue
 
-            index = self._current_index + 1
+            seg = self._current_index + 1
+            index = LAST_CHUNK_INDEX if seg >= self.total_count else seg
             chunk = self.chunks[self._current_index]
-            payload = build_qr_payload(index, chunk)
+            rel_path = self._display_name(self.file_path)
+            payload = build_qr_payload(rel_path, index, chunk)
 
             self._show_qr(index, chunk)
             self._append_log(index, chunk, payload)
@@ -301,18 +475,33 @@ class File2QrcPlayerApp:
             self._current_index += 1
             if self._current_index < self.total_count:
                 if not self._wait_tick():
-                    return
+                    return False
             elif not self._stop.is_set():
                 self._wait_tick()
+        return not self._stop.is_set()
 
-        if not self._stop.is_set() and self._played_count >= self.total_count:
+    def _play_loop(self) -> None:
+        while self.file_index < len(self.files) and not self._stop.is_set():
+            if self.file_index > 0:
+                self._load_current_file()
+                self._write_log_file_header()
+                self.win.after(0, self._refresh_header)
+
+            if not self._play_current_file():
+                return
+
+            self.file_index += 1
+
+        if not self._stop.is_set():
             def done() -> None:
                 self._playing.clear()
                 self.play_btn.config(text="播放")
-                self.status_var.set(
-                    f"播放完毕  |  共 {self.total_count} 张  |  "
-                    f"日志: {self._log_path or '(未生成)'}"
-                )
+                total_qr = self._total_chunks_all() if len(self.files) > 1 else self.total_count
+                if len(self.files) > 1:
+                    summary = f"全部播放完毕  |  {len(self.files)} 个文件  |  共 {total_qr} 张"
+                else:
+                    summary = f"播放完毕  |  共 {total_qr} 张"
+                self.status_var.set(f"{summary}  |  日志: {self._log_path or '(未生成)'}")
 
             self.win.after(0, done)
 
@@ -324,15 +513,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="将文件分块编码为二维码并顺序播放",
     )
-    parser.add_argument("file", help="要播放的文件路径（可为二进制/压缩包）")
+    parser.add_argument(
+        "path",
+        help="要播放的文件路径，或递归遍历的目录（目录模式跳过二进制文件）",
+    )
     args = parser.parse_args()
 
-    path = os.path.abspath(args.file)
-    if not os.path.isfile(path):
-        print(f"错误: 文件不存在: {path}", file=sys.stderr)
+    path = os.path.abspath(args.path)
+    if os.path.isdir(path):
+        files = collect_files(path)
+        if not files:
+            print(f"错误: 目录内没有可播放的文件: {path}", file=sys.stderr)
+            return 1
+        app = File2QrcPlayerApp(files, root_dir=path)
+    elif os.path.isfile(path):
+        app = File2QrcPlayerApp([path])
+    else:
+        print(f"错误: 路径不存在: {path}", file=sys.stderr)
         return 1
-
-    app = File2QrcPlayerApp(path)
     app.run()
     return 0
 
