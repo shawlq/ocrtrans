@@ -17,6 +17,15 @@ except ImportError as e:
     )
     raise SystemExit(1) from e
 
+try:
+    import zxingcpp
+except ImportError as e:
+    print(
+        "缺少依赖，请先安装: pip install zxing-cpp",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from e
+
 from file2qrc_player import LAST_CHUNK_INDEX
 
 PAYLOAD_SEP = b"%%"
@@ -49,10 +58,11 @@ def qr_decoded_to_bytes(data: str) -> bytes:
         return data.encode("utf-8")
 
 
-def decode_qr_payload(image_path: str) -> bytes | None:
-    img = cv2.imread(image_path)
-    if img is None:
-        return None
+def decode_qr_from_bgr(img) -> bytes | None:
+    """从 BGR 图像解码二维码，优先 zxing-cpp，回退 OpenCV。"""
+    for result in zxingcpp.read_barcodes(img):
+        if result.bytes:
+            return result.bytes
 
     detector = cv2.QRCodeDetector()
     data, _, _ = detector.detectAndDecode(img)
@@ -67,6 +77,13 @@ def decode_qr_payload(image_path: str) -> bytes | None:
     if not data:
         return None
     return qr_decoded_to_bytes(data)
+
+
+def decode_qr_payload(image_path: str) -> bytes | None:
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+    return decode_qr_from_bgr(img)
 
 
 def parse_payload(data: bytes) -> tuple[str, int, bytes] | None:

@@ -1,6 +1,8 @@
 # file_player.py 仅使用标准库（tkinter）
 # file2qrc_player.py 需要二维码生成
 # video2pic.py 需要视频读取
+# pic2txt.py / qrc_video_parser.py 需要二维码解码
 qrcode[pil]>=7.4
 Pillow>=10.0
 opencv-python>=4.8
+zxing-cpp>=2.2
